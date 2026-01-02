@@ -61,15 +61,14 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
         if (propCompanyId) {
             setFilterCompany(propCompanyId);
             setGenerateForm(prev => ({ ...prev, companyId: propCompanyId }));
-            fetchSalaries();
-            fetchDepartments(propCompanyId);
-            fetchEmployees(propCompanyId);
         }
     }, [propCompanyId]);
 
     useEffect(() => {
         if (filterCompany) {
             fetchSalaries();
+            fetchDepartments(filterCompany);
+            fetchEmployees(filterCompany);
         }
     }, [filterCompany, filterMonth, filterYear, filterStatus]);
 
@@ -93,6 +92,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
     }, [generateForm.departmentId, generateForm.companyId, employees]);
 
     const fetchSalaries = async () => {
+        if (!filterCompany) return; // Prevent fetch if no company selected
         setLoading(true);
         setError('');
         try {
@@ -102,7 +102,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                 year: filterYear,
             };
             if (filterStatus) params.status = filterStatus;
-
+            console.log('Fetching salaries with params:', params);
             const response = await axios.get('http://localhost:5000/api/salary-generation', { params });
             setSalaries(response.data);
         } catch (err) {
@@ -123,6 +123,10 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
     };
 
     const fetchDepartments = async (compId) => {
+        if (!compId) {
+            setDepartments([]);
+            return;
+        }
         try {
             const response = await axios.get('http://localhost:5000/api/departments', {
                 params: { companyId: compId }
@@ -134,6 +138,10 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
     };
 
     const fetchEmployees = async (compId) => {
+        if (!compId) {
+            setEmployees([]);
+            return;
+        }
         try {
             const response = await axios.get('http://localhost:5000/api/employees', {
                 params: { companyId: compId }
@@ -177,10 +185,10 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
             };
 
             // Log payload for debugging
-            console.log('Generating salary with payload:', payload);
+            console.log('Generating salary with payload:', payload,generateForm);
 
             const response = await axios.post('http://localhost:5000/api/salary-generation/generate', payload);
-
+            console.log(response.data);            
             const { results } = response.data;
             if (results.generated > 0) {
                 setSuccess(
@@ -197,7 +205,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
             if (results.errors && results.errors.length > 0) {
                 // Display errors in UI if any
                 const errorMsg = results.errors.map(e => `Employee ${e.employeeId}: ${e.error}`).join('; ');
-                setError(`Generation issues: ${errorMsg}`);
+                setError(prev => prev ? `${prev}; ${errorMsg}` : `Generation issues: ${errorMsg}`);
                 console.warn('Generation errors:', results.errors);
             }
 
@@ -428,6 +436,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                     <button
                         onClick={fetchSalaries}
                         className="px-4 py-2 bg-gray-600 hover:bg-gray-700 text-white font-medium rounded-lg transition duration-200"
+                        disabled={!filterCompany}
                     >
                         🔄 Refresh
                     </button>
@@ -460,6 +469,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                                 value={filterCompany}
                                 onChange={(e) => {
                                     setFilterCompany(e.target.value);
+                                    setGenerateForm(prev => ({ ...prev, companyId: e.target.value }));
                                     if (e.target.value) {
                                         fetchDepartments(e.target.value);
                                         fetchEmployees(e.target.value);
@@ -467,7 +477,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                                 }}
                                 className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                             >
-                                <option value="">All Companies</option>
+                                <option value="">Select Company</option>
                                 {companies.map((company) => (
                                     <option key={company.id} value={company.id}>{company.name}</option>
                                 ))}
@@ -661,7 +671,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                                             departmentId: e.target.value,
                                             employeeIds: []  // Reset manual selection when dept changes
                                         })}
-                                        disabled={!generateForm.companyId || !!propCompanyId && departments.length === 0}
+                                        disabled={!generateForm.companyId || departments.length === 0}
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
                                     >
                                         <option value="">All Departments</option>
@@ -681,7 +691,7 @@ const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
                                             ...generateForm, 
                                             employeeIds: Array.from(e.target.selectedOptions, option => parseInt(option.value)).filter(id => !isNaN(id))
                                         })}
-                                        disabled={!generateForm.companyId || !!propCompanyId && employees.length === 0}
+                                        disabled={!generateForm.companyId || employees.length === 0}
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 h-32"
                                     >
                                         {employees.map((emp) => (

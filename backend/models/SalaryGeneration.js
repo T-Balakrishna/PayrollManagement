@@ -68,7 +68,7 @@ module.exports = (sequelize, DataTypes) => {
         presentDays: {
             type: DataTypes.DECIMAL(5, 2),
             allowNull: false,
-            defaultValue: 0,
+            defaultValue: 7,
             comment: 'Days present (includes half days as 0.5)'
         },
         absentDays: {

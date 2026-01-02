@@ -9,7 +9,8 @@ const {
     Attendance,
     LeaveRequest,
     Company,
-    User
+    User,
+    sequelize
 } = require('../models');
 const { Op } = require('sequelize');
 const moment = require('moment');
@@ -24,9 +25,7 @@ const getWorkingDays = (year, month, excludeWeekends = false) => {
         let current = startDate.clone();
         let weekends = 0;
         while (current <= endDate) {
-            if (current.day() === 0 || current.day() === 6) {
-                weekends++;
-            }
+            if (current.day() === 0 || current.day() === 6) weekends++;
             current.add(1, 'day');
         }
         workingDays -= weekends;
@@ -35,191 +34,246 @@ const getWorkingDays = (year, month, excludeWeekends = false) => {
     return workingDays;
 };
 
-// Helper function to evaluate formula
+// Safe and robust formula evaluator
 const evaluateFormula = (formula, context) => {
+    if (!formula || typeof formula !== 'string') return 0;
+
     try {
-        // Replace component references with actual values
-        let expression = formula;
+        let expression = formula.trim();
+
+        // Only replace known keys from context
         for (const [key, value] of Object.entries(context)) {
             const regex = new RegExp(`\\b${key}\\b`, 'g');
-            expression = expression.replace(regex, value || 0);
+            const replacement = typeof value === 'string' ? `"${value.replace(/"/g, '\\"')}"` : (value ?? 0);
+            expression = expression.replace(regex, replacement);
         }
-        
-        // Safely evaluate the expression
+
+        console.log("Evaluating formula:", expression); // ← ADD THIS DEBUG LINE
+
         // eslint-disable-next-line no-eval
         const result = eval(expression);
-        return parseFloat(result) || 0;
+
+        const numericResult = parseFloat(result);
+        if (isNaN(numericResult)) {
+            console.warn("Formula returned non-numeric:", result);
+            return 0;
+        }
+
+        return numericResult;
     } catch (error) {
-        console.error('Error evaluating formula:', error);
+        console.error('Formula evaluation failed:', formula);
+        console.error('Context:', context);
+        console.error('Error:', error.message);
         return 0;
     }
 };
 
-// @desc    Generate salary for employees
-// @route   POST /api/salary-generation/generate
-// @access  Private
-exports.generateSalary = async (req, res) => {
-    const { companyId, month, year, employeeIds, generatedBy } = req.body;
+// Final robust salary component calculator
+const calculateSalaryComponents = async (salaryMaster, attendanceData, totalWorkingDays, externalContext = {}) => {
+    const components = [];
+    let totalEarnings = 0;
+    let totalDeductions = 0;
+    let basicSalary = 0;
 
-    if (!companyId || !month || !year) {
-        return res.status(400).json({ 
-            message: 'Company ID, month, and year are required' 
-        });
-    }
+    const paidDays = attendanceData.presentDays + attendanceData.paidLeaveDays +
+                     attendanceData.holidayDays + attendanceData.weekOffDays;
+    const attendanceFactor = totalWorkingDays > 0 ? paidDays / totalWorkingDays : 1;
 
-    try {
-        const results = {
-            processed: 0,
-            generated: 0,
-            skipped: 0,
-            errors: []
-        };
+    // Start with external context (grade, designation, etc.)
+    const context = { ...externalContext };
 
-        // Get pay period dates
-        const payPeriodStart = moment(`${year}-${month}-01`).format('YYYY-MM-DD');
-        const payPeriodEnd = moment(`${year}-${month}-01`).endOf('month').format('YYYY-MM-DD');
-        
-        // Get working days
-        const totalWorkingDays = getWorkingDays(year, month, false);
+    // PASS 1: Fixed + Percentage components
+    for (const empComponent of salaryMaster.EmployeeSalaryComponents) {
+        const component = empComponent.SalaryComponent;
+        if (!component) continue;
 
-        // Get employees to process
-        const whereClause = { companyId, status: 'Active' };
-        if (employeeIds && employeeIds.length > 0) {
-            whereClause.id = { [Op.in]: employeeIds };
+        const calcType = empComponent.valueType || 'Fixed';
+        if (calcType === 'Formula') continue; // Skip in first pass
+
+        let baseAmount = 0;
+        let calculatedAmount = 0;
+        let isProrated = false;
+        let proratedAmount = null;
+
+        if (calcType === 'Fixed') {
+            baseAmount = parseFloat(empComponent.fixedAmount) || 0;
+            calculatedAmount = baseAmount;
+        } else if (calcType === 'Percentage') {
+            const baseCode = empComponent.percentageBase?.toUpperCase();
+            const baseValue = context[baseCode] || 0;
+            const pct = parseFloat(empComponent.percentageValue) || 0;
+            baseAmount = (pct / 100) * baseValue;
+            calculatedAmount = baseAmount;
         }
 
-        const employees = await Employee.findAll({
-            where: whereClause,
-            include: [
-                {
-                    model: EmployeeSalaryMaster,
-                    as: 'EmployeeSalaryMasters',
-                    where: { status: 'Active' },
-                    required: true,
-                    include: [
-                        {
-                            model: EmployeeSalaryComponent,
-                            include: [
-                                { model: SalaryComponent },
-                                { model: Formula }
-                            ]
-                        }
-                    ]
-                }
-            ]
-        });
+        let finalAmount = calculatedAmount;
+        if (empComponent.isProrated && attendanceFactor < 1 && calculatedAmount > 0) {
+            proratedAmount = calculatedAmount * attendanceFactor;
+            finalAmount = proratedAmount;
+            isProrated = true;
+        }
 
-        for (const employee of employees) {
-            try {
-                results.processed++;
+        const code = component.code?.toUpperCase();
+        if (code) context[code] = finalAmount;
 
-                // Check if salary already generated for this month
-                const existing = await SalaryGeneration.findOne({
-                    where: {
-                        employeeId: employee.id,
-                        salaryMonth: month,
-                        salaryYear: year
-                    }
-                });
+        const compType = component.type || 'Earning';
 
-                if (existing) {
-                    results.skipped++;
-                    continue;
-                }
-
-                // Get employee's active salary structure
-                const salaryMaster = employee.EmployeeSalaryMasters[0];
-                
-                if (!salaryMaster) {
-                    results.errors.push({
-                        employeeId: employee.id,
-                        error: 'No active salary structure found'
-                    });
-                    continue;
-                }
-
-                // Calculate attendance metrics
-                const attendanceData = await calculateAttendanceMetrics(
-                    employee.id,
-                    payPeriodStart,
-                    payPeriodEnd
-                );
-
-                // Calculate salary components
-                const salaryCalculation = await calculateSalaryComponents(
-                    salaryMaster,
-                    attendanceData,
-                    totalWorkingDays
-                );
-
-                // Create salary generation record
-                const salaryGeneration = await SalaryGeneration.create({
-                    employeeId: employee.id,
-                    employeeSalaryMasterId: salaryMaster.id,
-                    companyId,
-                    salaryMonth: month,
-                    salaryYear: year,
-                    payPeriodStart,
-                    payPeriodEnd,
-                    workingDays: totalWorkingDays,
-                    presentDays: attendanceData.presentDays,
-                    absentDays: attendanceData.absentDays,
-                    paidLeaveDays: attendanceData.paidLeaveDays,
-                    unpaidLeaveDays: attendanceData.unpaidLeaveDays,
-                    holidayDays: attendanceData.holidayDays,
-                    weekOffDays: attendanceData.weekOffDays,
-                    overtimeHours: attendanceData.overtimeHours,
-                    lateCount: attendanceData.lateCount,
-                    earlyExitCount: attendanceData.earlyExitCount,
-                    basicSalary: salaryCalculation.basicSalary,
-                    totalEarnings: salaryCalculation.totalEarnings,
-                    totalDeductions: salaryCalculation.totalDeductions,
-                    grossSalary: salaryCalculation.grossSalary,
-                    netSalary: salaryCalculation.netSalary,
-                    overtimePay: salaryCalculation.overtimePay,
-                    lateDeduction: salaryCalculation.lateDeduction,
-                    absentDeduction: salaryCalculation.absentDeduction,
-                    leaveDeduction: salaryCalculation.leaveDeduction,
-                    status: 'Generated',
-                    generatedBy
-                });
-
-                // Create salary generation details
-                for (const component of salaryCalculation.components) {
-                    await SalaryGenerationDetail.create({
-                        salaryGenerationId: salaryGeneration.id,
-                        componentId: component.componentId,
-                        componentName: component.componentName,
-                        componentType: component.componentType,
-                        calculationType: component.calculationType,
-                        baseAmount: component.baseAmount,
-                        calculatedAmount: component.calculatedAmount,
-                        isProrated: component.isProrated,
-                        proratedAmount: component.proratedAmount,
-                        formula: component.formula
-                    });
-                }
-
-                results.generated++;
-            } catch (error) {
-                results.errors.push({
-                    employeeId: employee.id,
-                    error: error.message
-                });
+        if (compType === 'Earning') {
+            totalEarnings += finalAmount;
+            if (code === 'BP' || component.name.toUpperCase().includes('BASIC')) {
+                basicSalary = finalAmount;
             }
+        } else if (compType === 'Deduction') {
+            totalDeductions += finalAmount;
         }
 
-        res.status(200).json({
-            message: 'Salary generation completed',
-            results
-        });
-    } catch (error) {
-        console.error('Error generating salaries:', error);
-        res.status(500).json({ 
-            message: 'Server Error', 
-            error: error.message 
+        components.push({
+            componentId: component.id,
+            componentName: component.name,
+            componentType: compType,
+            calculationType: calcType,
+            baseAmount,
+            calculatedAmount: finalAmount,
+            isProrated,
+            proratedAmount,
+            formula: null
         });
     }
+
+    // PASS 2: Formula components
+    for (const empComponent of salaryMaster.EmployeeSalaryComponents) {
+        
+        if (empComponent.valueType !== 'Formula' || !empComponent.formulaExpression) continue;
+        
+        const component = empComponent.SalaryComponent;
+        console.log("emp",empComponent,"comp",component);
+        if (!component) continue;
+
+        let calculatedAmount = evaluateFormula(empComponent.formulaExpression, context);
+        console.log("Formula expression:", empComponent.formulaExpression);
+        console.log("Context:", context);
+        console.log("Result from eval:", calculatedAmount);        
+        let baseAmount = calculatedAmount;
+        let formulaUsed = empComponent.formulaExpression;
+
+        let finalAmount = calculatedAmount;
+        let isProrated = false;
+        let proratedAmount = null;
+
+        if (empComponent.isProrated && attendanceFactor < 1 && calculatedAmount > 0) {
+            proratedAmount = calculatedAmount * attendanceFactor;
+            finalAmount = proratedAmount;
+            isProrated = true;
+        }
+
+        const code = component.code?.toUpperCase();
+        if (code) context[code] = finalAmount;
+
+        const compType = component.type || 'Earning';
+
+        if (compType === 'Earning') {
+            totalEarnings += finalAmount;
+        } else if (compType === 'Deduction') {
+            totalDeductions += finalAmount;
+        }
+
+        components.push({
+            componentId: component.id,
+            componentName: component.name,
+            componentType: compType,
+            calculationType: 'Formula',
+            baseAmount,
+            calculatedAmount: finalAmount,
+            isProrated,
+            proratedAmount,
+            formula: formulaUsed
+        });
+    }
+
+    // PASS 3: Special components
+    const perDayRate = basicSalary > 0 && totalWorkingDays > 0 ? basicSalary / totalWorkingDays : 0;
+
+    if (attendanceData.absentDays > 0 && perDayRate > 0) {
+        const amount = perDayRate * attendanceData.absentDays;
+        totalDeductions += amount;
+        components.push({
+            componentId: null,
+            componentName: 'Absent Deduction',
+            componentType: 'Deduction',
+            calculationType: 'Attendance',
+            baseAmount: 0,
+            calculatedAmount: amount,
+            isProrated: false,
+            proratedAmount: null,
+            formula: null
+        });
+    }
+
+    if (attendanceData.unpaidLeaveDays > 0 && perDayRate > 0) {
+        const amount = perDayRate * attendanceData.unpaidLeaveDays;
+        totalDeductions += amount;
+        components.push({
+            componentId: null,
+            componentName: 'Unpaid Leave Deduction',
+            componentType: 'Deduction',
+            calculationType: 'Attendance',
+            baseAmount: 0,
+            calculatedAmount: amount,
+            isProrated: false,
+            proratedAmount: null,
+            formula: null
+        });
+    }
+
+    if (attendanceData.lateCount > 3) {
+        const excess = attendanceData.lateCount - 3;
+        const amount = perDayRate * 0.1 * excess;
+        totalDeductions += amount;
+        components.push({
+            componentId: null,
+            componentName: 'Late Arrival Deduction',
+            componentType: 'Deduction',
+            calculationType: 'Policy',
+            baseAmount: 0,
+            calculatedAmount: amount,
+            isProrated: false,
+            proratedAmount: null,
+            formula: null
+        });
+    }
+
+    if (attendanceData.overtimeHours > 0 && basicSalary > 0) {
+        const hourlyRate = basicSalary / (totalWorkingDays * 8);
+        const overtimePay = hourlyRate * 1.5 * attendanceData.overtimeHours;
+        totalEarnings += overtimePay;
+        components.push({
+            componentId: null,
+            componentName: 'Overtime Pay',
+            componentType: 'Earning',
+            calculationType: 'Attendance',
+            baseAmount: 0,
+            calculatedAmount: overtimePay,
+            isProrated: false,
+            proratedAmount: null,
+            formula: null
+        });
+    }
+
+    const grossSalary = totalEarnings;
+    const netSalary = Math.max(0, grossSalary - totalDeductions);
+
+    return {
+        components,
+        basicSalary,
+        totalEarnings,
+        totalDeductions,
+        grossSalary,
+        netSalary,
+        overtimePay: attendanceData.overtimeHours > 0 ? (basicSalary / (totalWorkingDays * 8)) * 1.5 * attendanceData.overtimeHours : 0,
+        lateDeduction: attendanceData.lateCount > 3 ? perDayRate * 0.1 * (attendanceData.lateCount - 3) : 0,
+        absentDeduction: perDayRate * attendanceData.absentDays,
+        leaveDeduction: perDayRate * attendanceData.unpaidLeaveDays
+    };
 };
 
 // Helper function to calculate attendance metrics
@@ -297,126 +351,145 @@ const calculateAttendanceMetrics = async (employeeId, startDate, endDate) => {
     };
 };
 
-// Helper function to calculate salary components
-const calculateSalaryComponents = async (salaryMaster, attendanceData, totalWorkingDays) => {
-    const components = [];
-    let totalEarnings = 0;
-    let totalDeductions = 0;
-    let basicSalary = 0;
-    let overtimePay = 0;
-    let lateDeduction = 0;
-    let absentDeduction = 0;
-    let leaveDeduction = 0;
+// @desc    Generate salary for employees
+// @route   POST /api/salary-generation/generate
+// @access  Private
+exports.generateSalary = async (req, res) => {
+    console.log("Request payload:", req.body);
+    const { companyId, month, year, employeeIds, generatedBy } = req.body;
 
-    // Calculate attendance factor for proration
-    const paidDays = attendanceData.presentDays + attendanceData.paidLeaveDays + 
-                     attendanceData.holidayDays + attendanceData.weekOffDays;
-    const attendanceFactor = paidDays / totalWorkingDays;
-
-    // Build context for formula evaluation
-    const context = {};
-
-    // First pass: Calculate fixed and percentage components
-    for (const empComponent of salaryMaster.EmployeeSalaryComponents) {
-        const component = empComponent.SalaryComponent;
-        let baseAmount = parseFloat(empComponent.amount) || 0;
-        let calculatedAmount = baseAmount;
-        let isProrated = false;
-        let proratedAmount = null;
-
-        // Apply proration if component should be prorated based on attendance
-        if (empComponent.isProrated && attendanceFactor < 1) {
-            proratedAmount = baseAmount * attendanceFactor;
-            calculatedAmount = proratedAmount;
-            isProrated = true;
-        }
-
-        if (component.componentType === 'Earning') {
-            totalEarnings += calculatedAmount;
-            if (component.name.toLowerCase().includes('basic')) {
-                basicSalary = calculatedAmount;
-            }
-        } else {
-            totalDeductions += calculatedAmount;
-        }
-
-        context[component.name] = calculatedAmount;
-
-        components.push({
-            componentId: component.id,
-            componentName: component.name,
-            componentType: component.componentType,
-            calculationType: empComponent.calculationType,
-            baseAmount,
-            calculatedAmount,
-            isProrated,
-            proratedAmount,
-            formula: null
-        });
+    if (!companyId || !month || !year) {
+        return res.status(400).json({ message: 'Company ID, month, and year are required' });
     }
 
-    // Second pass: Calculate formula-based components
-    for (const empComponent of salaryMaster.EmployeeSalaryComponents) {
-        if (empComponent.Formula) {
-            const component = empComponent.SalaryComponent;
-            const formula = empComponent.Formula.expression;
-            
-            const calculatedAmount = evaluateFormula(formula, context);
+    try {
+        const results = { processed: 0, generated: 0, skipped: 0, errors: [] };
 
-            // Update the component in the array
-            const componentIndex = components.findIndex(c => c.componentId === component.id);
-            if (componentIndex !== -1) {
-                components[componentIndex].calculatedAmount = calculatedAmount;
-                components[componentIndex].formula = formula;
-                
-                if (component.componentType === 'Earning') {
-                    totalEarnings += (calculatedAmount - components[componentIndex].baseAmount);
-                } else {
-                    totalDeductions += (calculatedAmount - components[componentIndex].baseAmount);
+        const payPeriodStart = moment(`${year}-${month}-01`).format('YYYY-MM-DD');
+        const payPeriodEnd = moment(`${year}-${month}-01`).endOf('month').format('YYYY-MM-DD');
+        const totalWorkingDays = getWorkingDays(year, month, false);
+
+        const whereClause = { companyId, status: 'Active' };
+        if (employeeIds && employeeIds.length > 0) {
+            whereClause.id = { [Op.in]: employeeIds };
+        }
+
+        const employees = await Employee.findAll({
+            where: whereClause,
+            include: [
+                {
+                    model: EmployeeSalaryMaster,
+                    as: 'EmployeeSalaryMasters',
+                    where: { 
+                        status: 'Active',
+                        effectiveFrom: { [Op.lte]: new Date(`${year}-${month}-01`) },
+                        [Op.or]: [
+                            { effectiveTo: null },
+                            { effectiveTo: { [Op.gte]: new Date(`${year}-${month}-01`) } }
+                        ]
+                    },
+                    required: true,
+                    include: [{ model: EmployeeSalaryComponent, include: [SalaryComponent, Formula] }]
                 }
+            ]
+        });
+
+        for (const employee of employees) {
+            try {
+                results.processed++;
+
+                const existing = await SalaryGeneration.findOne({
+                    where: { employeeId: employee.id, salaryMonth: month, salaryYear: year }
+                });
+
+                if (existing) {
+                    results.skipped++;
+                    continue;
+                }
+
+                const salaryMaster = employee.EmployeeSalaryMasters[0];
+                console.log("Debuggin ",salaryMaster);
+                
+                if (!salaryMaster) {
+                    results.errors.push({ employeeId: employee.id, error: 'No active salary structure' });
+                    continue;
+                }
+
+                const attendanceData = await calculateAttendanceMetrics(employee.id, payPeriodStart, payPeriodEnd);
+
+                // Build external context for non-component variables
+                const externalContext = {
+                    grade: employee.grade?.name || '',
+                    designation: employee.designation?.name || ''
+                };
+
+                const salaryCalculation = await calculateSalaryComponents(
+                    salaryMaster,
+                    attendanceData,
+                    totalWorkingDays,
+                    externalContext
+                );
+
+                console.log("Final Salary Calculation for", employee.firstName, employee.lastName, ":", salaryCalculation);
+
+                const salaryGeneration = await SalaryGeneration.create({
+                    employeeId: employee.id,
+                    employeeSalaryMasterId: salaryMaster.id,
+                    companyId,
+                    salaryMonth: month,
+                    salaryYear: year,
+                    payPeriodStart,
+                    payPeriodEnd,
+                    workingDays: totalWorkingDays,
+                    presentDays: attendanceData.presentDays,
+                    absentDays: attendanceData.absentDays,
+                    paidLeaveDays: attendanceData.paidLeaveDays,
+                    unpaidLeaveDays: attendanceData.unpaidLeaveDays,
+                    holidayDays: attendanceData.holidayDays,
+                    weekOffDays: attendanceData.weekOffDays,
+                    overtimeHours: attendanceData.overtimeHours,
+                    lateCount: attendanceData.lateCount,
+                    earlyExitCount: attendanceData.earlyExitCount,
+                    basicSalary: salaryCalculation.basicSalary,
+                    totalEarnings: salaryCalculation.totalEarnings,
+                    totalDeductions: salaryCalculation.totalDeductions,
+                    grossSalary: salaryCalculation.grossSalary,
+                    netSalary: salaryCalculation.netSalary,
+                    overtimePay: salaryCalculation.overtimePay,
+                    lateDeduction: salaryCalculation.lateDeduction,
+                    absentDeduction: salaryCalculation.absentDeduction,
+                    leaveDeduction: salaryCalculation.leaveDeduction,
+                    status: 'Generated',
+                    generatedBy
+                });
+
+                for (const component of salaryCalculation.components) {
+                    await SalaryGenerationDetail.create({
+                        salaryGenerationId: salaryGeneration.id,
+                        componentId: component.componentId,
+                        componentName: component.componentName,
+                        componentType: component.componentType,
+                        calculationType: component.calculationType,
+                        baseAmount: component.baseAmount,
+                        calculatedAmount: component.calculatedAmount,
+                        isProrated: component.isProrated,
+                        proratedAmount: component.proratedAmount,
+                        formula: component.formula
+                    });
+                }
+
+                results.generated++;
+            } catch (error) {
+                results.errors.push({ employeeId: employee.id, error: error.message });
+                console.error("Error processing employee", employee.id, ":", error);
             }
-
-            context[component.name] = calculatedAmount;
         }
+
+        res.status(200).json({ message: 'Salary generation completed successfully', results });
+    } catch (error) {
+        console.error('Error generating salaries:', error);
+        res.status(500).json({ message: 'Server Error', error: error.message });
     }
-
-    // Calculate overtime pay (if applicable)
-    if (attendanceData.overtimeHours > 0 && basicSalary > 0) {
-        const hourlyRate = basicSalary / (totalWorkingDays * 8); // Assuming 8-hour workday
-        overtimePay = hourlyRate * 1.5 * attendanceData.overtimeHours; // 1.5x for overtime
-        totalEarnings += overtimePay;
-    }
-
-    // Calculate deductions for absences and unpaid leaves
-    if (attendanceData.absentDays > 0 || attendanceData.unpaidLeaveDays > 0) {
-        const perDaySalary = basicSalary / totalWorkingDays;
-        absentDeduction = perDaySalary * attendanceData.absentDays;
-        leaveDeduction = perDaySalary * attendanceData.unpaidLeaveDays;
-        totalDeductions += (absentDeduction + leaveDeduction);
-    }
-
-    // Calculate late deduction (optional - configure as needed)
-    if (attendanceData.lateCount > 3) { // Example: deduct after 3 lates
-        const excessLates = attendanceData.lateCount - 3;
-        lateDeduction = (basicSalary / totalWorkingDays) * 0.1 * excessLates; // 10% of daily salary per late
-        totalDeductions += lateDeduction;
-    }
-
-    const grossSalary = totalEarnings;
-    const netSalary = grossSalary - totalDeductions;
-
-    return {
-        components,
-        basicSalary,
-        totalEarnings,
-        totalDeductions,
-        grossSalary,
-        netSalary,
-        overtimePay,
-        lateDeduction,
-        absentDeduction,
-        leaveDeduction
-    };
 };
 
 // @desc    Get salary generations with filters
