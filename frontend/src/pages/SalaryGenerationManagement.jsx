@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 
-const SalaryGenerationManagement = ({ companyId }) => {
+const SalaryGenerationManagement = ({ companyId: propCompanyId }) => {
     const [salaries, setSalaries] = useState([]);
     const [companies, setCompanies] = useState([]);
     const [departments, setDepartments] = useState([]);
@@ -11,7 +11,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
     const [success, setSuccess] = useState('');
     
     // Filter states
-    const [filterCompany, setFilterCompany] = useState(companyId || '');
+    const [filterCompany, setFilterCompany] = useState(propCompanyId || '');
     const [filterMonth, setFilterMonth] = useState(new Date().getMonth() + 1);
     const [filterYear, setFilterYear] = useState(new Date().getFullYear());
     const [filterStatus, setFilterStatus] = useState('');
@@ -26,7 +26,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
     
     // Generate form states
     const [generateForm, setGenerateForm] = useState({
-        companyId: companyId || '',
+        companyId: propCompanyId || '',
         month: new Date().getMonth() + 1,
         year: new Date().getFullYear(),
         departmentId: '',
@@ -57,19 +57,40 @@ const SalaryGenerationManagement = ({ companyId }) => {
     const years = Array.from({ length: 5 }, (_, i) => new Date().getFullYear() - i);
 
     useEffect(() => {
-        if (companyId) {
-            fetchSalaries();
-            fetchDepartments(companyId);
-            fetchEmployees(companyId);
-        }
         fetchCompanies();
-    }, [companyId]);
+        if (propCompanyId) {
+            setFilterCompany(propCompanyId);
+            setGenerateForm(prev => ({ ...prev, companyId: propCompanyId }));
+            fetchSalaries();
+            fetchDepartments(propCompanyId);
+            fetchEmployees(propCompanyId);
+        }
+    }, [propCompanyId]);
 
     useEffect(() => {
         if (filterCompany) {
             fetchSalaries();
         }
     }, [filterCompany, filterMonth, filterYear, filterStatus]);
+
+    // Auto-filter employees by department in generate form
+    useEffect(() => {
+        if (generateForm.companyId && employees.length > 0 && generateForm.departmentId) {
+            const deptId = parseInt(generateForm.departmentId);
+            if (!isNaN(deptId)) {
+                const deptEmployees = employees.filter(emp => emp.departmentId === deptId);
+                setGenerateForm(prev => ({
+                    ...prev,
+                    employeeIds: deptEmployees.map(emp => emp.id)
+                }));
+            }
+        } else if (generateForm.companyId && employees.length > 0) {
+            setGenerateForm(prev => ({
+                ...prev,
+                employeeIds: []
+            }));
+        }
+    }, [generateForm.departmentId, generateForm.companyId, employees]);
 
     const fetchSalaries = async () => {
         setLoading(true);
@@ -129,28 +150,60 @@ const SalaryGenerationManagement = ({ companyId }) => {
         setSuccess('');
 
         try {
-            if (!generateForm.companyId || !generateForm.month || !generateForm.year) {
-                setError('Company, month, and year are required');
+            // Enhanced validation
+            if (!generateForm.companyId || generateForm.companyId === '') {
+                setError('Company is required');
+                setLoading(false);
+                return;
+            }
+            if (!generateForm.month || isNaN(parseInt(generateForm.month)) || parseInt(generateForm.month) < 1 || parseInt(generateForm.month) > 12) {
+                setError('Valid month is required');
+                setLoading(false);
+                return;
+            }
+            if (!generateForm.year || isNaN(parseInt(generateForm.year))) {
+                setError('Valid year is required');
                 setLoading(false);
                 return;
             }
 
-            const response = await axios.post('http://localhost:5000/api/salary-generation/generate', {
-                ...generateForm,
+            // Ensure numeric values
+            const payload = {
+                companyId: generateForm.companyId,
+                month: parseInt(generateForm.month),
+                year: parseInt(generateForm.year),
+                employeeIds: generateForm.employeeIds.map(id => parseInt(id)).filter(id => !isNaN(id)),
                 generatedBy: 1
-            });
+            };
+
+            // Log payload for debugging
+            console.log('Generating salary with payload:', payload);
+
+            const response = await axios.post('http://localhost:5000/api/salary-generation/generate', payload);
 
             const { results } = response.data;
-            setSuccess(
-                `Salary generation completed! Processed: ${results.processed}, Generated: ${results.generated}, Skipped: ${results.skipped}`
-            );
+            if (results.generated > 0) {
+                setSuccess(
+                    `Salary generation completed! Processed: ${results.processed}, Generated: ${results.generated}, Skipped: ${results.skipped}`
+                );
+            } else if (results.skipped > 0) {
+                setError(
+                    `No new salaries generated. ${results.skipped} employees already have salary records for the selected period. Delete existing records to regenerate.`
+                );
+            } else {
+                setError('No salaries generated. Check if employees have active salary structures.');
+            }
 
-            if (results.errors.length > 0) {
+            if (results.errors && results.errors.length > 0) {
+                // Display errors in UI if any
+                const errorMsg = results.errors.map(e => `Employee ${e.employeeId}: ${e.error}`).join('; ');
+                setError(`Generation issues: ${errorMsg}`);
                 console.warn('Generation errors:', results.errors);
             }
 
             setGenerateDialogOpen(false);
-            fetchSalaries();
+            // Force refresh with current filters to show any new/updated
+            await fetchSalaries();
         } catch (err) {
             setError(err.response?.data?.message || 'Failed to generate salary');
             console.error('Error generating salary:', err);
@@ -284,7 +337,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
             return (
                 <tr>
                     <td colSpan={10} className="px-6 py-12 text-center text-gray-500">
-                        No salary records found
+                        No salary records found for the selected filters. Try generating new ones or adjusting filters.
                     </td>
                 </tr>
             );
@@ -368,6 +421,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
                     <button
                         onClick={() => setGenerateDialogOpen(true)}
                         className="px-4 py-2 bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white font-medium rounded-lg transition duration-200 flex items-center gap-2"
+                        disabled={companies.length === 0}
                     >
                         ➕ Generate Salary
                     </button>
@@ -399,7 +453,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
             {/* Filters */}
             <div className="bg-white p-6 rounded-lg shadow mb-6">
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                    {!companyId && (
+                    {!propCompanyId && (
                         <div>
                             <label className="block text-sm font-semibold text-gray-700 mb-2">Company</label>
                             <select
@@ -424,7 +478,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
                         <label className="block text-sm font-semibold text-gray-700 mb-2">Month</label>
                         <select
                             value={filterMonth}
-                            onChange={(e) => setFilterMonth(e.target.value)}
+                            onChange={(e) => setFilterMonth(parseInt(e.target.value))}
                             className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                         >
                             {months.map((month) => (
@@ -436,7 +490,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
                         <label className="block text-sm font-semibold text-gray-700 mb-2">Year</label>
                         <select
                             value={filterYear}
-                            onChange={(e) => setFilterYear(e.target.value)}
+                            onChange={(e) => setFilterYear(parseInt(e.target.value))}
                             className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                         >
                             {years.map((year) => (
@@ -549,15 +603,22 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                     <select
                                         value={generateForm.companyId}
                                         onChange={(e) => {
-                                            setGenerateForm({ ...generateForm, companyId: e.target.value });
-                                            if (e.target.value) {
-                                                fetchDepartments(e.target.value);
-                                                fetchEmployees(e.target.value);
+                                            const newCompanyId = e.target.value;
+                                            setGenerateForm(prev => ({
+                                                ...prev,
+                                                companyId: newCompanyId,
+                                                departmentId: '',
+                                                employeeIds: []
+                                            }));
+                                            if (newCompanyId) {
+                                                fetchDepartments(newCompanyId);
+                                                fetchEmployees(newCompanyId);
                                             }
                                         }}
-                                        disabled={!!companyId}
+                                        disabled={!!propCompanyId}
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
                                     >
+                                        <option value="">Select Company</option>
                                         {companies.map((company) => (
                                             <option key={company.id} value={company.id}>{company.name}</option>
                                         ))}
@@ -569,7 +630,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                         <label className="block text-sm font-semibold text-gray-700 mb-2">Month *</label>
                                         <select
                                             value={generateForm.month}
-                                            onChange={(e) => setGenerateForm({ ...generateForm, month: e.target.value })}
+                                            onChange={(e) => setGenerateForm({ ...generateForm, month: parseInt(e.target.value) })}
                                             className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         >
                                             {months.map((month) => (
@@ -581,7 +642,7 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                         <label className="block text-sm font-semibold text-gray-700 mb-2">Year *</label>
                                         <select
                                             value={generateForm.year}
-                                            onChange={(e) => setGenerateForm({ ...generateForm, year: e.target.value })}
+                                            onChange={(e) => setGenerateForm({ ...generateForm, year: parseInt(e.target.value) })}
                                             className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
                                         >
                                             {years.map((year) => (
@@ -595,8 +656,12 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                     <label className="block text-sm font-semibold text-gray-700 mb-2">Department (Optional)</label>
                                     <select
                                         value={generateForm.departmentId}
-                                        onChange={(e) => setGenerateForm({ ...generateForm, departmentId: e.target.value })}
-                                        disabled={!generateForm.companyId}
+                                        onChange={(e) => setGenerateForm({ 
+                                            ...generateForm, 
+                                            departmentId: e.target.value,
+                                            employeeIds: []  // Reset manual selection when dept changes
+                                        })}
+                                        disabled={!generateForm.companyId || !!propCompanyId && departments.length === 0}
                                         className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
                                     >
                                         <option value="">All Departments</option>
@@ -604,16 +669,20 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                             <option key={dept.id} value={dept.id}>{dept.name}</option>
                                         ))}
                                     </select>
+                                    <p className="text-xs text-gray-600 mt-1">Selecting a department will auto-include all employees in it for generation</p>
                                 </div>
 
                                 <div>
-                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Employees (Optional)</label>
+                                    <label className="block text-sm font-semibold text-gray-700 mb-2">Employees (Optional - Overrides Dept)</label>
                                     <select
                                         multiple
-                                        value={generateForm.employeeIds}
-                                        onChange={(e) => setGenerateForm({ ...generateForm, employeeIds: Array.from(e.target.selectedOptions, option => option.value) })}
-                                        disabled={!generateForm.companyId}
-                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                                        value={generateForm.employeeIds.map(id => id.toString())}
+                                        onChange={(e) => setGenerateForm({ 
+                                            ...generateForm, 
+                                            employeeIds: Array.from(e.target.selectedOptions, option => parseInt(option.value)).filter(id => !isNaN(id))
+                                        })}
+                                        disabled={!generateForm.companyId || !!propCompanyId && employees.length === 0}
+                                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 h-32"
                                     >
                                         {employees.map((emp) => (
                                             <option key={emp.id} value={emp.id}>
@@ -621,20 +690,28 @@ const SalaryGenerationManagement = ({ companyId }) => {
                                             </option>
                                         ))}
                                     </select>
-                                    <p className="text-xs text-gray-600 mt-1">Leave empty to generate for all employees</p>
+                                    <p className="text-xs text-gray-600 mt-1">Leave empty to generate for all employees (or auto-filtered by department)</p>
                                 </div>
                             </div>
                         </div>
                         <div className="flex justify-end gap-3 p-6 border-t border-gray-200 bg-gray-50">
                             <button
-                                onClick={() => setGenerateDialogOpen(false)}
+                                onClick={() => {
+                                    setGenerateDialogOpen(false);
+                                    // Reset form if needed
+                                    setGenerateForm(prev => ({
+                                        ...prev,
+                                        departmentId: '',
+                                        employeeIds: []
+                                    }));
+                                }}
                                 className="px-4 py-2 text-gray-700 bg-gray-200 hover:bg-gray-300 rounded-lg font-medium transition"
                             >
                                 Cancel
                             </button>
                             <button
                                 onClick={handleGenerateSalary}
-                                disabled={loading}
+                                disabled={loading || !generateForm.companyId || companies.length === 0}
                                 className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition disabled:opacity-50"
                             >
                                 {loading ? '⏳ Generating...' : 'Generate'}

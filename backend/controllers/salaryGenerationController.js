@@ -94,7 +94,7 @@ exports.generateSalary = async (req, res) => {
                 {
                     model: EmployeeSalaryMaster,
                     as: 'EmployeeSalaryMasters',
-                    where: { isActive: true },
+                    where: { status: 'Active' },
                     required: true,
                     include: [
                         {
